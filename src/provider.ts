@@ -17,6 +17,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import type { HostServices } from "@vibecontrols/plugin-sdk/contract";
@@ -56,7 +57,7 @@ export class GitleaksProtectProvider implements SecurityProvider {
 
   async ensureToolInstalled(): Promise<void> {
     const dataDir =
-      this.host?.getDataDir?.() ?? path.join(process.env.HOME ?? ".", ".boff/vibecontrols");
+      this.host?.getDataDir?.() ?? path.join(os.homedir(), ".boff/vibecontrols");
     this.toolPath = await resolveToolPath(
       {
         dataDir,
