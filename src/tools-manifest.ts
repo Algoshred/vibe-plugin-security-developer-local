@@ -2,16 +2,16 @@
  * Tools manifest for developer.local stage.
  *
  *   gitleaks  — v8.21.2 (sha256 reused from secrets-pr; same release).
- *   semgrep   — v1.95.0; semgrep ships official precompiled MUSL Linux
- *               binaries (Alpine wheels) but no prebuilt darwin/windows
- *               binaries. For platforms without a download entry, the
- *               tool-installer falls back to PATH-resolution against
- *               `semgrep --version` (developers typically install via
- *               `pipx install semgrep`).
+ *               https://github.com/gitleaks/gitleaks/releases/tag/v8.21.2
+ *   semgrep   — v1.95.0; semgrep is distributed exclusively via PyPI
+ *               (pip / pipx). The v1.95.0 GitHub release publishes no
+ *               binary assets for any platform. The downloads map is
+ *               therefore empty and the tool-installer falls back to
+ *               PATH-resolution against `semgrep --version`. Developers
+ *               install via `pipx install semgrep`.
  *
- * TODO: backfill real sha256 values for the semgrep linux entry from
- * https://github.com/semgrep/semgrep/releases/tag/v1.95.0 before
- * promoting this plugin out of scaffold status.
+ * Updating versions is a deliberate audited operation: bump the version
+ * + sha256 here, re-run sanity, publish a new CalVer release.
  */
 import type { ToolManifest } from "@vibecontrols/vibe-plugin-security/tool-installer";
 
@@ -54,16 +54,8 @@ export const TOOLS_MANIFEST: ToolManifest = {
     version: SEMGREP_VERSION,
     binaryName: "semgrep",
     versionMatcher: SEMGREP_VERSION.replace(/\./g, "\\."),
-    downloads: {
-      // TODO: real sha256 placeholder — backfill from
-      // https://github.com/semgrep/semgrep/releases/tag/v1.95.0 before
-      // shipping the real provider integration.
-      "linux-x64": {
-        url: `https://github.com/semgrep/semgrep/releases/download/v${SEMGREP_VERSION}/semgrep-${SEMGREP_VERSION}-musllinux_x86_64.tar.gz`,
-        sha256: "0000000000000000000000000000000000000000000000000000000000000000",
-        binaryWithinArchive: "semgrep",
-        archive: "tar.gz",
-      },
-    },
+    // no upstream binary for any platform — semgrep ships via PyPI only
+    // (`pipx install semgrep`). tool-installer falls back to PATH probe.
+    downloads: {},
   },
 };
