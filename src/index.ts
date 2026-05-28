@@ -1,13 +1,15 @@
 /**
  * @vibecontrols/vibe-plugin-security-developer-local
  *
- * Gitleaks-protect + Semgrep --quick provider for developer.local.
- * Registers as a `security.secrets` provider (shares the secrets type
- * with the PR variant — see PROVIDER_TYPE_FOR_STAGE in
+ * Gitleaks-protect provider for developer.local. Registers as a
+ * `security.secrets` provider (shares the secrets type with the PR
+ * variant — see PROVIDER_TYPE_FOR_STAGE in
  * @vibecontrols/vibe-plugin-security/types) on the host's
- * ServiceRegistry. The user picks "gitleaks-protect-semgrep" as their
- * default provider for the `developer.local` stage and the meta plugin
+ * ServiceRegistry. The user picks "gitleaks-protect" as their default
+ * provider for the `developer.local` stage and the meta plugin
  * dispatches.
+ *
+ * TODO(security): wire Semgrep --quick after Python detection lands.
  */
 import { ProviderRegistry, TelemetryEmitter, createLifecycleHooks } from "@vibecontrols/plugin-sdk";
 import type {
@@ -17,13 +19,13 @@ import type {
   VibePluginFactory,
 } from "@vibecontrols/plugin-sdk/contract";
 
-import { GitleaksProtectSemgrepProvider } from "./provider.js";
+import { GitleaksProtectProvider } from "./provider.js";
 
 const PLUGIN_NAME = "security-developer-local";
-const PLUGIN_VERSION = "2026.528.1";
+const PLUGIN_VERSION = "2026.528.2";
 
 export const createPlugin: VibePluginFactory = (_ctx: ProfileContext): VibePlugin => {
-  const provider = new GitleaksProtectSemgrepProvider();
+  const provider = new GitleaksProtectProvider();
   const telemetry = new TelemetryEmitter(PLUGIN_NAME, PLUGIN_VERSION);
 
   const lifecycle = createLifecycleHooks({
@@ -32,9 +34,9 @@ export const createPlugin: VibePluginFactory = (_ctx: ProfileContext): VibePlugi
     onInit: async (host: HostServices) => {
       await provider.init(host);
       const registry = new ProviderRegistry(host);
-      registry.registerProvider("security.secrets", "gitleaks-protect-semgrep", provider);
+      registry.registerProvider("security.secrets", "gitleaks-protect", provider);
       telemetry.emit("security.developer-local.registered", {
-        provider: "gitleaks-protect-semgrep",
+        provider: "gitleaks-protect",
         toolVersion: provider.toolVersion,
       });
     },
@@ -43,7 +45,7 @@ export const createPlugin: VibePluginFactory = (_ctx: ProfileContext): VibePlugi
   return {
     name: PLUGIN_NAME,
     version: PLUGIN_VERSION,
-    description: "Local pre-commit secrets + quick SAST for the developer.local lifecycle stage.",
+    description: "Local pre-commit secrets scan for the developer.local lifecycle stage.",
     tags: ["backend", "provider", "integration"],
     capabilities: {
       storage: "rw",
@@ -57,4 +59,4 @@ export const createPlugin: VibePluginFactory = (_ctx: ProfileContext): VibePlugi
 };
 
 export default createPlugin;
-export { GitleaksProtectSemgrepProvider } from "./provider.js";
+export { GitleaksProtectProvider } from "./provider.js";

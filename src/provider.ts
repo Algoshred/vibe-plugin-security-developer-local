@@ -1,19 +1,30 @@
 /**
- * GitleaksProtectSemgrepProvider — implements SecurityProvider for stage
- * `developer.local`. Wraps `gitleaks protect` (uncommitted-only, fast)
- * + Semgrep `--quick` for a low-latency pre-commit experience.
+ * GitleaksProtectProvider — implements SecurityProvider for stage
+ * `developer.local`.
  *
- * TODO: Wave 2 scaffold — real gitleaks-protect + Semgrep integration
- * is pending. This v1 verifies the tool path resolves and returns a
- * single info finding describing what a real scan would do.
+ * Spawns the pinned Gitleaks binary in `protect` mode (scans
+ * uncommitted + staged changes only — much faster than full-history
+ * `detect`, which is what the `pull_request.fast` variant uses).
+ * Normalizes the SARIF output into NormalizedFinding[]
+ * (category: "secret") and returns the SARIF as an evidence artifact.
+ *
+ * TODO(security): wire Semgrep --quick after Python detection lands —
+ * Semgrep ships official MUSL Linux binaries via pip/pipx but no
+ * prebuilt darwin/windows binaries; integrating it cleanly needs a
+ * PATH-based fallback for `semgrep --version` plus per-file scoping
+ * (we only want to scan the changed working-tree files at this stage).
  */
+import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
+import { promises as fs } from "node:fs";
 import * as path from "node:path";
 
 import type { HostServices } from "@vibecontrols/plugin-sdk/contract";
+import { normalizeSarif } from "@vibecontrols/vibe-plugin-security/normalizer";
 import { resolveToolPath } from "@vibecontrols/vibe-plugin-security/tool-installer";
 import type {
   NormalizedFinding,
+  ScanEvidenceArtifact,
   SecurityProvider,
   SecurityProviderMetadata,
   SecurityScanInput,
@@ -22,15 +33,22 @@ import type {
   SecurityStage,
 } from "@vibecontrols/vibe-plugin-security/types";
 
-import { GITLEAKS_VERSION, SEMGREP_VERSION, TOOLS_MANIFEST } from "./tools-manifest.js";
+import { GITLEAKS_VERSION, TOOLS_MANIFEST } from "./tools-manifest.js";
 
-export class GitleaksProtectSemgrepProvider implements SecurityProvider {
-  readonly name = "gitleaks-protect-semgrep";
+interface GitleaksProtectConfig {
+  configPath?: string;
+  ignorePath?: string;
+  extraArgs?: string[];
+}
+
+export class GitleaksProtectProvider implements SecurityProvider {
+  readonly name = "gitleaks-protect";
   readonly stage: SecurityStage = "developer.local";
-  readonly toolVersion = `gitleaks-protect@${GITLEAKS_VERSION}+semgrep@${SEMGREP_VERSION}`;
+  readonly toolVersion = GITLEAKS_VERSION;
 
   private host?: HostServices;
-  private gitleaksPath?: string;
+  private toolPath?: string;
+  private active = new Map<string, ChildProcess>();
 
   async init(host: HostServices): Promise<void> {
     this.host = host;
@@ -39,28 +57,51 @@ export class GitleaksProtectSemgrepProvider implements SecurityProvider {
   async ensureToolInstalled(): Promise<void> {
     const dataDir =
       this.host?.getDataDir?.() ?? path.join(process.env.HOME ?? ".", ".boff/vibecontrols");
-    const ctx = {
-      dataDir,
-      log: {
-        info: (m: string) => this.host?.logger?.info?.("gitleaks-protect-semgrep-provider", m),
-        warn: (m: string) => this.host?.logger?.warn?.("gitleaks-protect-semgrep-provider", m),
-        error: (m: string) => this.host?.logger?.error?.("gitleaks-protect-semgrep-provider", m),
+    this.toolPath = await resolveToolPath(
+      {
+        dataDir,
+        log: {
+          info: (m) => this.host?.logger?.info?.("gitleaks-protect-provider", m),
+          warn: (m) => this.host?.logger?.warn?.("gitleaks-protect-provider", m),
+          error: (m) => this.host?.logger?.error?.("gitleaks-protect-provider", m),
+        },
       },
-    };
-    // We only resolve the gitleaks binary here; Semgrep is best-effort
-    // (only invoked when Python is on PATH) and is checked at run time.
-    this.gitleaksPath = await resolveToolPath(ctx, "gitleaks", TOOLS_MANIFEST.gitleaks);
+      "gitleaks",
+      TOOLS_MANIFEST.gitleaks,
+    );
   }
 
   async run(input: SecurityScanInput): Promise<SecurityScanResult> {
-    const startedAt = Date.now();
-    input.onProgress?.({ pct: 10, message: "Verifying gitleaks-protect tool path" });
+    if (!this.toolPath) {
+      await this.ensureToolInstalled();
+    }
+    if (!this.toolPath) throw new Error("gitleaks-protect-provider: toolPath unavailable");
 
-    try {
-      if (!this.gitleaksPath) {
-        await this.ensureToolInstalled();
-      }
-    } catch (err) {
+    const cfg = (input.config as GitleaksProtectConfig) ?? {};
+    const sarifPath = path.join(input.workdir, "gitleaks-protect.sarif");
+    const args = [
+      "protect",
+      "--source",
+      input.repoLocalPath,
+      "--report-format",
+      "sarif",
+      "--report-path",
+      sarifPath,
+      "--no-banner",
+      "--staged",
+      "--exit-code",
+      "0",
+    ];
+    if (cfg.configPath) args.push("--config", cfg.configPath);
+    if (cfg.extraArgs) args.push(...cfg.extraArgs);
+
+    const startedAt = Date.now();
+    input.onProgress?.({ pct: 5, message: "Starting Gitleaks protect scan" });
+
+    const result = await this.spawnAndWait(input.runId, args);
+    if (result.code !== 0 && result.code !== 1) {
+      // gitleaks returns 1 when findings are present (still success for us).
+      // Any other non-zero exit indicates a real error.
       return {
         runId: input.runId,
         status: "errored",
@@ -68,63 +109,100 @@ export class GitleaksProtectSemgrepProvider implements SecurityProvider {
         evidence: [],
         durationMs: Date.now() - startedAt,
         summary: { critical: 0, high: 0, medium: 0, low: 0, info: 0 },
-        errorReason: `gitleaks-protect-semgrep: tool resolution failed: ${String(err)}`,
+        errorReason: `gitleaks-protect exited ${result.code}: ${result.stderr.slice(0, 500)}`,
       };
     }
 
-    input.onProgress?.({ pct: 100, message: "Stub finding emitted" });
+    input.onProgress?.({ pct: 80, message: "Parsing SARIF report" });
 
-    const fingerprint = createHash("sha256").update(`${this.name}:${input.runId}`).digest("hex");
+    let findings: NormalizedFinding[] = [];
+    let evidence: ScanEvidenceArtifact[] = [];
+    try {
+      const raw = await fs.readFile(sarifPath, "utf-8");
+      findings = normalizeSarif(raw, this.name, "secret");
+      const sha256 = createHash("sha256").update(raw).digest("hex");
+      const stat = await fs.stat(sarifPath);
+      evidence = [
+        {
+          type: "sarif",
+          localPath: sarifPath,
+          sha256,
+          sizeBytes: stat.size,
+        },
+      ];
+    } catch (err) {
+      // No SARIF produced (no findings; gitleaks may skip writing the file).
+      this.host?.logger?.warn?.("gitleaks-protect-provider", `no SARIF produced: ${String(err)}`);
+    }
 
-    const finding: NormalizedFinding = {
-      fingerprint,
-      ruleId: `${this.name}.stub`,
-      title:
-        "developer.local: gitleaks-protect-semgrep scaffolded — real scanner integration pending",
-      severity: "info",
-      category: "secret",
-      description:
-        "Wave 2 scaffold: when integrated, this provider will run `gitleaks protect` against the uncommitted index (fast, sub-second) and Semgrep `--quick` against changed files when Python is available on PATH. See src/provider.ts TODO.",
-      rawProviderRef: JSON.stringify({
-        stub: true,
-        message: `Real gitleaks-protect integration pending; tool path resolves to ${
-          this.gitleaksPath ?? "<unresolved>"
-        }.`,
-        semgrepVersion: SEMGREP_VERSION,
-        gitleaksVersion: GITLEAKS_VERSION,
-      }),
-    };
-
-    const summary: SecurityScanSummary = { critical: 0, high: 0, medium: 0, low: 0, info: 1 };
+    input.onProgress?.({ pct: 100, message: "Scan complete" });
+    const summary: SecurityScanSummary = summarize(findings);
 
     return {
       runId: input.runId,
       status: "succeeded",
-      findings: [finding],
-      evidence: [],
+      findings,
+      evidence,
       durationMs: Date.now() - startedAt,
       summary,
     };
   }
 
-  async cancel(_runId: string): Promise<void> {
-    // Stub provider has no in-flight subprocesses to cancel.
+  async cancel(runId: string): Promise<void> {
+    const child = this.active.get(runId);
+    if (!child) return;
+    try {
+      child.kill("SIGTERM");
+      // Best-effort SIGKILL after 5s.
+      setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }, 5000);
+    } finally {
+      this.active.delete(runId);
+    }
   }
 
   metadata(): SecurityProviderMetadata {
     return {
       stage: this.stage,
-      supportedProfiles: [
-        "backend",
-        "frontend",
-        "cli",
-        "sdk",
-        "mcp",
-        "chrome-extension",
-        "vscode-extension",
-      ],
+      supportedProfiles: ["backend", "frontend", "cli", "sdk", "mcp"],
       toolVersion: this.toolVersion,
-      description: "gitleaks-protect + Semgrep --quick for developer.local pre-commit",
+      description: "Gitleaks protect (uncommitted-only) for developer.local",
     };
   }
+
+  private spawnAndWait(
+    runId: string,
+    args: string[],
+  ): Promise<{ code: number | null; stdout: string; stderr: string }> {
+    if (!this.toolPath) throw new Error("gitleaks-protect-provider: toolPath unavailable");
+    return new Promise((resolve) => {
+      const child = spawn(this.toolPath as string, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      this.active.set(runId, child);
+      let stdout = "";
+      let stderr = "";
+      child.stdout?.on("data", (b: Buffer) => (stdout += b.toString()));
+      child.stderr?.on("data", (b: Buffer) => (stderr += b.toString()));
+      child.on("close", (code) => {
+        this.active.delete(runId);
+        resolve({ code, stdout, stderr });
+      });
+      child.on("error", (err) => {
+        this.active.delete(runId);
+        resolve({ code: -1, stdout, stderr: err.message });
+      });
+    });
+  }
+}
+
+function summarize(findings: NormalizedFinding[]): SecurityScanSummary {
+  const s: SecurityScanSummary = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+  for (const f of findings) s[f.severity]++;
+  return s;
 }
